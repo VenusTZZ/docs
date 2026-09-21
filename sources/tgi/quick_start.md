@@ -219,15 +219,103 @@ server import ok
 
 ## 5. 启动服务并验证推理
 
-服务生命周期由 fork 仓库自带的 `start-tgi.sh` / `stop-tgi.sh` 脚本管理：
-启动（含模型就绪轮询）、优雅停止与残留进程清理都封装在脚本里，推理请求
-直接 `curl` 调用即可。
+服务生命周期由 fork 仓库自带的 `start-tgi.sh` / `stop-tgi.sh` 脚本管理。
+下面按步骤演示，最后一节给出把全部步骤串起来的一键端到端验证（CI 看护
+执行的正是这段流程）。以下命令均在「获取源码」克隆出的 `tgi` 目录下执行。
 
-### 单卡基线
+### 5.1 启动服务
 
-单卡启动后调用 `/generate` 做一次真实推理，输出作为双卡验证的基线
-（此块为标准输出捕获块，回复存入 `reply_single`，脚本日志重定向到 stderr
-不参与捕获）：
+`start-tgi.sh` 负责后台启动、就绪轮询与日志落盘（默认 `/tmp/tgi.log`），
+脚本返回 `[READY]` 即服务可用。单卡：
+
+```shell
+cd tgi
+./start-tgi.sh --num-shard 1 --devices 0
+```
+
+双卡 HCCL 张量并行：
+
+```shell
+cd tgi
+./start-tgi.sh --num-shard 2 --devices 0,1
+```
+
+> 不传 `--model-id` 时默认使用 Qwen/Qwen3-0.6B，首次启动自动经 ModelScope
+> 下载（缓存于 `~/.cache/modelscope`，之后直接命中）；也可用
+> `--model-id /path/to/model` 指定本地路径。
+
+启动成功的输出：
+
+```
+[START] model_id=/path/to/model
+[START] num_shard=1  devices=0  port=8080
+[START] launcher pid 12345
+[READY] TGI is serving on http://127.0.0.1:8080 after ~130s
+[READY] stop with: ./stop-tgi.sh
+```
+
+**冷启动约 2-3 分钟是正常现象**，`[READY]` 出现前服务不可访问，耗时主要在：
+
+- 模型权重加载并搬运到 NPU 显存（Qwen3-0.6B 约 1.2 GB）；
+- KV cache 分配与模型预热（`Warming up model` 阶段）；
+- 双卡时还需 HCCL 组网初始化，比单卡略久。
+
+期间可另开终端观察 `tail -f /tmp/tgi.log`——出现 `Connected` 即 HTTP 服务
+已就绪（日志时间跨度即权重加载与预热耗时）：
+
+```
+2026-09-21T06:20:42Z  INFO text_generation_router_v3: Warming up model
+2026-09-21T06:21:37Z  INFO text_generation_launcher: KV-cache blocks: 2708, size: 64
+2026-09-21T06:21:47Z  INFO text_generation_router::server: Connected
+```
+
+随后 `start-tgi.sh` 的就绪轮询打印 `[READY] TGI is serving on
+http://127.0.0.1:8080 after ~130s`——~130s 为 910B 实测冷启动时长，不同
+机器略有差异，属正常范围。
+
+### 5.2 确认服务就绪
+
+```shell
+curl -4s http://127.0.0.1:8080/info
+```
+
+返回模型信息 JSON（含 `model_id`、`max_total_tokens` 等字段）即就绪；
+为空则说明服务尚未就绪或已退出，用 `tail -50 /tmp/tgi.log` 查看原因。
+
+### 5.3 发起推理
+
+```shell
+curl -4fs http://127.0.0.1:8080/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"inputs":"What is 1+1? Answer:","parameters":{"max_new_tokens":16,"do_sample":false}}' \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["generated_text"].strip().replace("\n", " "))'
+```
+
+`do_sample=false` 为贪心解码，相同输入输出确定。示例输出：
+
+```
+2  The question is: What is the sum of the numbers 1
+```
+
+OpenAI 兼容接口：`curl -4 http://127.0.0.1:8080/v1/chat/completions`。
+
+### 5.4 停止服务
+
+```shell
+cd tgi
+./stop-tgi.sh
+```
+
+脚本会优雅退出 launcher 并确认 NPU 上无残留进程；若 `npu-smi info` 里
+仍有残留（残留进程会占用 NPU 与端口，导致新实例报
+`EJ0003 Failed to bind the IP port`），用 `./stop-tgi.sh --force` 清理。
+
+### 5.5 一键端到端验证（单卡基线 + 双卡张量并行）
+
+下面的两个块把上述步骤串成一次完整验证，可直接整块复制执行，也是 CI
+看护执行的流程。先跑单卡基线：启动、调用 `/generate` 做一次真实推理、
+停止，回复作为双卡验证的基线（此块为标准输出捕获块，回复存入
+`reply_single`，脚本日志重定向到 stderr 不参与捕获）：
 
 ```shell #test-setup store="reply_single" load="model_path>>model_path"
 set -e
@@ -244,10 +332,8 @@ curl -4fs http://127.0.0.1:8080/generate \
 ./stop-tgi.sh >&2
 ```
 
-### 双卡张量并行验证
-
-用两张卡（`--num-shard 2`，HCCL 张量并行）再跑一次相同请求，验证回复非空、
-且与单卡基线**逐字一致**（贪心解码下张量并行不改变输出）：
+再用两张卡（`--num-shard 2`，HCCL 张量并行）跑一次相同请求，验证回复
+非空、且与单卡基线**逐字一致**（贪心解码下张量并行不改变输出）：
 
 ```shell #test id="smoke-tp2" load="model_path>>model_path" load="reply_single>>reply_single"
 set -e
@@ -279,16 +365,6 @@ echo "TGI-TP2-OK: $REPLY"
 ```shell #test-result id="smoke-tp2"
 TGI-TP2-OK: ...
 ```
-
-## 6. 停止服务
-
-```shell
-./stop-tgi.sh
-```
-
-> 若 `npu-smi info` 里仍有残留的 `text-generation-server` 进程，用
-> `./stop-tgi.sh --force` 清理后再重新启动（残留进程会占用 NPU 与
-> 端口，导致新实例报 `EJ0003 Failed to bind the IP port`）。
 
 ## 小贴士
 
