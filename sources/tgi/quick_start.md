@@ -219,45 +219,29 @@ server import ok
 
 ## 5. 启动服务并验证推理
 
+服务生命周期由 fork 仓库自带的 `start-tgi.sh` / `stop-tgi.sh` 脚本管理：
+启动（含模型就绪轮询）、优雅停止与残留进程清理都封装在脚本里，推理请求
+直接 `curl` 调用即可。
+
 ### 单卡基线
 
-启动 TGI（单卡、bfloat16、贪心解码），轮询就绪后调用 `/generate` 做一次真实
-推理，输出作为双卡验证的基线（此块为标准输出捕获块，回复存入
-`reply_single`，不参与输出比对）：
+单卡启动后调用 `/generate` 做一次真实推理，输出作为双卡验证的基线
+（此块为标准输出捕获块，回复存入 `reply_single`，脚本日志重定向到 stderr
+不参与捕获）：
 
 ```shell #test-setup store="reply_single" load="model_path>>model_path"
 set -e
 cd tgi
-export PATH="$PWD/target/release-opt:$PATH"
-export ATTENTION=flashdecoding-npu PREFIX_CACHING=0 CUDA_GRAPHS=0
-export ASCEND_VISIBLE_DEVICES=0
-export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
-
-text-generation-launcher \
-  --model-id "<model_path>" \
-  --num-shard 1 --port 8080 \
-  --max-total-tokens 128 --max-input-tokens 100 \
-  > tgi-launcher-single.log 2>&1 &
-LID=$!
 cleanup() {
-  kill "$LID" 2>/dev/null || true
-  for _ in $(seq 1 15); do kill -0 "$LID" 2>/dev/null || break; sleep 2; done
-  pkill -TERM -f "text-generation[-]server" 2>/dev/null || true
-  sleep 3
+  ./stop-tgi.sh --force >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
-
-for i in $(seq 1 60); do
-  curl -4fs http://127.0.0.1:8080/info >/dev/null 2>&1 && break
-  kill -0 "$LID" 2>/dev/null || { echo "launcher exited early"; tail -50 tgi-launcher-single.log; exit 1; }
-  sleep 5
-done
-curl -4fs http://127.0.0.1:8080/info >/dev/null || { echo "server not ready"; tail -50 tgi-launcher-single.log; exit 1; }
-
+./start-tgi.sh --num-shard 1 --devices 0 --model-id "<model_path>" >&2
 curl -4fs http://127.0.0.1:8080/generate \
   -H 'Content-Type: application/json' \
   -d '{"inputs":"What is 1+1? Answer:","parameters":{"max_new_tokens":16,"do_sample":false}}' \
   | python -c 'import json, sys; print(json.load(sys.stdin)["generated_text"].strip().replace("\n", " "))'
+./stop-tgi.sh >&2
 ```
 
 ### 双卡张量并行验证
@@ -268,10 +252,10 @@ curl -4fs http://127.0.0.1:8080/generate \
 ```shell #test id="smoke-tp2" load="model_path>>model_path" load="reply_single>>reply_single"
 set -e
 cd tgi
-export PATH="$PWD/target/release-opt:$PATH"
-export ATTENTION=flashdecoding-npu PREFIX_CACHING=0 CUDA_GRAPHS=0
-export ASCEND_VISIBLE_DEVICES=0,1
-export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256
+cleanup() {
+  ./stop-tgi.sh --force >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 # wait until the single-card service above has fully released port 8080
 for i in $(seq 1 30); do
@@ -279,26 +263,7 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-text-generation-launcher \
-  --model-id "<model_path>" \
-  --num-shard 2 --port 8080 \
-  --max-total-tokens 128 --max-input-tokens 100 \
-  > tgi-launcher-tp2.log 2>&1 &
-LID=$!
-cleanup() {
-  kill "$LID" 2>/dev/null || true
-  sleep 3
-  pkill -TERM -f "text-generation[-]server" 2>/dev/null || true
-}
-trap cleanup EXIT
-
-for i in $(seq 1 90); do
-  curl -4fs http://127.0.0.1:8080/info >/dev/null 2>&1 && break
-  kill -0 "$LID" 2>/dev/null || { echo "launcher exited early"; tail -50 tgi-launcher-tp2.log; exit 1; }
-  sleep 5
-done
-curl -4fs http://127.0.0.1:8080/info >/dev/null || { echo "server not ready"; tail -50 tgi-launcher-tp2.log; exit 1; }
-
+./start-tgi.sh --num-shard 2 --devices 0,1 --model-id "<model_path>" >&2
 REPLY=$(curl -4fs http://127.0.0.1:8080/generate \
   -H 'Content-Type: application/json' \
   -d '{"inputs":"What is 1+1? Answer:","parameters":{"max_new_tokens":16,"do_sample":false}}' \
@@ -306,6 +271,7 @@ REPLY=$(curl -4fs http://127.0.0.1:8080/generate \
 [ -n "$REPLY" ] || { echo "empty reply"; exit 1; }
 [ "$REPLY" = "<reply_single>" ] || { echo "TP2 reply differs from single-card baseline"; echo "single: <reply_single>"; echo "tp2:    $REPLY"; exit 1; }
 echo "TGI-TP2-OK: $REPLY"
+./stop-tgi.sh >&2
 ```
 
 输出结果如下（`...` 为模型回复内容，与单卡基线一致）：
@@ -317,11 +283,11 @@ TGI-TP2-OK: ...
 ## 6. 停止服务
 
 ```shell
-kill "$(pgrep -f text-generation-launcher)"
+./stop-tgi.sh
 ```
 
 > 若 `npu-smi info` 里仍有残留的 `text-generation-server` 进程，用
-> `pkill -f text-generation-server` 清理后再重新启动（残留进程会占用 NPU 与
+> `./stop-tgi.sh --force` 清理后再重新启动（残留进程会占用 NPU 与
 > 端口，导致新实例报 `EJ0003 Failed to bind the IP port`）。
 
 ## 小贴士
