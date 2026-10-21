@@ -1,6 +1,6 @@
 # text-generation-inference
 
-text-generation-inference 通用文档由 Hugging Face 官方维护。本页收录 Ascend NPU 适配的快速上手。
+text-generation-inference 通用文档由 Hugging Face 官方维护。本页收录 Huawei Ascend NPU 适配的快速上手。
 
 ```{include} quick_start.md
 ```
